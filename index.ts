@@ -1921,6 +1921,9 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
             machine: config.crossMachine.machineName,
           }, {
             remoteCommand: config.crossMachine.remoteCommand,
+            transport: config.crossMachine.transport,
+            hcBin: config.crossMachine.hcBin,
+            remoteArgv: config.crossMachine.remoteArgv,
           });
           const remoteTarget = relaySenderName({ name: remote.agent.name, machine: remote.machine.label });
           pi.appendEntry("intercom_sent", {
@@ -3301,13 +3304,18 @@ Usage:
     }
     if (!getLiveContext(ctx, generation)) return;
 
-    const discoveryDeps = { run: runCommand, herdrBin: process.env.HERDR_BIN_PATH ?? "herdr" };
+    const discoveryDeps = {
+      run: runCommand,
+      herdrBin: process.env.HERDR_BIN_PATH ?? "herdr",
+      transport: config.crossMachine.transport,
+      hcBin: config.crossMachine.hcBin,
+    };
     const lister: RemoteSessionLister = {
       listMachines: () => listSavedMachines(discoveryDeps),
       listAgents: (machine) => listMachineAgents(machine, discoveryDeps),
     };
     const picked = await ctx.ui.custom<HandoverPickerResult | undefined>(
-      (tui, theme, keybindings, done) => new HandoverPicker(tui, theme, keybindings, { currentSession, sessions, lister, preselectSessionId }, done),
+      (tui, theme, keybindings, done) => new HandoverPicker(tui, theme, keybindings, { currentSession, sessions, lister, preselectSessionId, transport: config.crossMachine.transport }, done),
       { overlay: true, overlayOptions: { width: 88 } },
     ).catch(() => undefined);
     if (!picked || !getLiveContext(ctx, generation)) return;

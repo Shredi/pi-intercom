@@ -499,7 +499,10 @@ Create `~/.pi/agent/intercom/config.json`:
 | `replyHint` | true | Include reply instruction in incoming messages |
 | `status` | — | Optional custom status suffix shown after the automatic lifecycle status, for example `thinking · researching` |
 | `crossMachine.machineName` | lowercased short hostname | Name peers use for this host in their Herdr saved-machine lists |
-| `crossMachine.remoteCommand` | `"pi-intercom"` | Command invoked through non-interactive SSH on remote machines |
+| `crossMachine.remoteCommand` | `"pi-intercom"` | Command invoked through non-interactive SSH on remote machines (`herdr` transport only) |
+| `crossMachine.transport` | `"herdr"` | `"herdr"` uses Herdr saved machines over SSH; `"hc"` uses herdr-core's `hc` CLI, see [Cross-machine over hc](#cross-machine-over-hc) |
+| `crossMachine.hcBin` | `"hc"` | The `hc` executable (`hc` transport). The `HC_BIN` environment variable overrides it |
+| `crossMachine.remoteArgv` | `["pi-intercom"]` | Program and leading arguments run on the remote machine (`hc` transport): 1 to 8 words, each limited to letters, digits, and `. _ : / \ space -`; the first word may not start with `-` after leading spaces |
 
 If `config.json` cannot be parsed or contains an invalid value, pi-intercom logs the error and fails closed for inbound broker auto-triggering by using `inboundTrigger: "never"` until the config is fixed.
 Obsolete `toolVisibility` values are ignored; the generic `intercom` tool remains stable in the active tool set for prompt-cache friendliness.
@@ -638,6 +641,24 @@ For native cross-machine `send`, address the session as `reviewer@workstation` (
 The relay carries structured SSH-asserted origin metadata. Incoming headers render `From worker@laptop · unverified cross-machine` and provide a new-message `send` hint to that address. This identity is not cryptographically verified: anyone with SSH access that can invoke the relay can claim it. Cross-machine `ask`, `replyTo`, attachments, supersede, retry, `noWake`, cwd/project-pane routing, and lifecycle actions are not supported in v1.
 
 Discovery and delivery are bounded by five-second and fifteen-second timeouts respectively. Remote hosts must provide a compatible `pi-intercom relay` command. Non-interactive SSH often has a minimal `PATH`; set the trusted global `crossMachine.remoteCommand` to an absolute command when needed. Unknown relay versions and non-JSON responses produce an upgrade error.
+
+### Cross-machine over hc
+
+Set `crossMachine.transport` to `"hc"` to route `name@machine` sends through herdr-core's `hc` CLI instead of Herdr saved machines and `ssh`. The default `"herdr"` transport is the SSH behavior described above, unchanged. With `"hc"`, only `hc` is used: there is no Herdr saved-machine lookup and no fallback to plain SSH when a machine is unknown.
+
+```json
+{
+  "crossMachine": {
+    "transport": "hc",
+    "hcBin": "hc",
+    "remoteArgv": ["C:/Program Files/nodejs/node.exe", "<path>/pi-intercom/cli.mjs"]
+  }
+}
+```
+
+The machine is matched exactly (case-sensitive) against `hc machine ls --json`; unknown or disabled machines fail closed. `hc` knows terminals, not Pi sessions, so no agent listing happens: the remote broker resolves `<name|uuid>` inside `relay`. Delivery runs `hc exec --on <machine> --timeout 15 -i --json -- <remoteArgv…> relay --envelope-stdin --json` with the envelope on stdin; `hc` passes the argv without a shell, so a word may contain a space (a Windows path under `Program Files`). The relay reply is read from the base64 `stdout` field of `hc`'s JSON answer.
+
+The envelope is identical to the `herdr` transport's except that a name target is not resolved to a session id (herdr resolves it locally, `hc` sends the name for the remote broker) (version 1, trust `ssh-asserted`; `hc` rides on SSH), so the receiving machine can run an unmodified upstream pi-intercom `relay`. The `/handover` picker lists `hc` machines and offers a field for the `<name|uuid>` target instead of a session list. The same timeouts and upgrade errors apply.
 
 ## How It Works
 

@@ -2,6 +2,24 @@ const FULL_SESSION_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9
 const SESSION_ID_IN_PATH = /_([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i;
 export const DISCOVERY_TIMEOUT_MS = 5_000;
 
+const REMOTE_ARGV_WORD = /^[A-Za-z0-9._:/\\ -]+$/;
+const REMOTE_ARGV_MAX_WORDS = 8;
+
+/** Returns why `value` is not a usable hc remote argv, or undefined. A word may contain spaces: hc passes argv without a shell. */
+export function validateRemoteArgv(value: unknown): string | undefined {
+  if (!Array.isArray(value) || value.length < 1 || value.length > REMOTE_ARGV_MAX_WORDS) {
+    return `must be an array of 1 to ${REMOTE_ARGV_MAX_WORDS} words`;
+  }
+  for (const word of value) {
+    if (typeof word !== "string" || !REMOTE_ARGV_WORD.test(word)) {
+      return "words must be strings of letters, digits, and . _ : / \\ space - only";
+    }
+  }
+  if (value[0].trimStart().startsWith("-")) return "first word must not start with -";
+  if (value[0].trim() === "") return "first word must not be blank";
+  return undefined;
+}
+
 export interface SavedMachine {
   label: string;
   target: string;
@@ -31,6 +49,9 @@ export interface DiscoveryDeps {
     timedOut?: boolean;
   }>;
   herdrBin: string;
+  /** Machine source: Herdr saved machines (default) or herdr-core's `hc machine ls`. */
+  transport?: "herdr" | "hc";
+  hcBin?: string;
   discoveryTimeoutMs?: number;
 }
 
@@ -90,7 +111,22 @@ export function parseCrossMachineTarget(target: string): { agentTarget: string; 
   return { agentTarget: parts[0], machineLabel: parts[1] };
 }
 
+/** Parses `hc machine ls --json`: {"machines": [{name, state, ...}]}. The machine name is the exact, case-sensitive label. */
+export function parseHcMachines(raw: string): SavedMachine[] {
+  const value = parseJsonOutput(raw, "hc machine ls");
+  const rows = Array.isArray(value) ? value : isRecord(value) && Array.isArray(value.machines) ? value.machines : [];
+  return rows.flatMap((row): SavedMachine[] => {
+    if (!isRecord(row) || typeof row.name !== "string" || !row.name) return [];
+    return [{ label: row.name, target: row.name, enabled: row.enabled !== false && row.state !== "disabled" }];
+  });
+}
+
 export async function listSavedMachines(deps: DiscoveryDeps): Promise<SavedMachine[]> {
+  if (deps.transport === "hc") {
+    const listed = await deps.run(deps.hcBin ?? "hc", ["machine", "ls", "--json"], undefined, deps.discoveryTimeoutMs ?? DISCOVERY_TIMEOUT_MS);
+    if (listed.code !== 0) throw new Error(`Could not list hc machines: ${listed.timedOut ? "timed out" : listed.stderr.trim() || `exit ${listed.code}`}`);
+    return parseHcMachines(listed.stdout);
+  }
   const listed = await deps.run(deps.herdrBin, ["machine", "list", "--json"], undefined, deps.discoveryTimeoutMs ?? DISCOVERY_TIMEOUT_MS);
   if (listed.code !== 0) throw new Error(`Could not list Herdr saved machines: ${listed.timedOut ? "timed out" : listed.stderr.trim() || `exit ${listed.code}`}`);
   return parseSavedMachines(listed.stdout);
@@ -159,6 +195,21 @@ export async function discoverRemoteAgent(
   deps: DiscoveryDeps & { remoteCommand: string },
 ): Promise<DiscoveredRemoteAgent> {
   const explicit = parseCrossMachineTarget(target);
+  if (deps.transport === "hc") {
+    // hc knows terminals, not Pi sessions: the remote broker resolves <name|uuid> inside `relay`.
+    // The hc machine list is authoritative: no Herdr lookup and no plain-SSH fallback.
+    const selected = (await listSavedMachines(deps)).filter((machine) => machine.enabled && machine.label === explicit.machineLabel);
+    if (selected.length === 0) {
+      throw new Error(`hc machine "${explicit.machineLabel}" is unknown or disabled.`);
+    }
+    if (selected.length > 1) {
+      throw new Error(`hc machine "${explicit.machineLabel}" is ambiguous; expected exactly one enabled machine.`);
+    }
+    const agent: RemoteAgent = FULL_SESSION_UUID.test(explicit.agentTarget)
+      ? { name: explicit.agentTarget, sessionId: explicit.agentTarget }
+      : { name: explicit.agentTarget };
+    return { machine: selected[0]!, agent };
+  }
   // Herdr is optional: without it, the machine label is used as an SSH host.
   const saved = (await listSavedMachines(deps).catch((error: NodeJS.ErrnoException) => {
     if (error.code === "ENOENT") return [];

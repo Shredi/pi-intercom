@@ -171,3 +171,144 @@ test("structured remote failure preserves the reported error", async () => {
     /Remote intercom delivery via workstation failed: target rejected the envelope version/,
   );
 });
+
+const hcMachines = JSON.stringify({ machines: [
+  { host: "h1.example", id: "m-1", name: "Workstation", session: "s1", state: "up", target: "Workstation", temporary: false, version: "1", via: "ssh" },
+  { host: "h2.example", id: "m-2", name: "parked", session: "s1", state: "disabled", target: "parked", temporary: false, version: "1", via: "ssh" },
+] });
+const b64 = (text: string) => Buffer.from(text, "utf8").toString("base64");
+const hcReply = (relayStdout: string, code = 0, extra: Record<string, unknown> = {}) => JSON.stringify({
+  code, ms: 5, signal: null, stderr: "", stdout: b64(relayStdout), timed_out: false, truncated: false, ...extra,
+});
+
+type Call = { command: string; args: string[]; stdin?: string; timeoutMs?: number };
+function hcRunner(execReply: () => { code: number; stdout: string; stderr?: string; timedOut?: boolean }, calls: Call[] = []): CommandRunner {
+  return async (command, args, stdin, timeoutMs) => {
+    calls.push({ command, args, stdin, timeoutMs });
+    if (args[0] === "machine") return { code: 0, stdout: hcMachines, stderr: "" };
+    return { stderr: "", ...execReply() };
+  };
+}
+
+test("hc transport lists machines, runs hc exec without a shell and decodes the relay reply", async () => {
+  const calls: Call[] = [];
+  const run = hcRunner(() => ({ code: 0, stdout: hcReply('{"ok":true,"version":1}\n') }), calls);
+  const hostileText = 'hello; $(touch /tmp/nope)\n"quoted" äöü';
+  const result = await sendCrossMachine("reviewer@Workstation", hostileText, origin, {
+    run,
+    transport: "hc",
+    hcBin: "hc-bin",
+    remoteArgv: ["C:/Program Files/nodejs/node.exe", "C:/pi tools/cli.mjs"],
+  });
+  assert.equal(result.machine.label, "Workstation");
+  assert.equal(result.stdout, '{"ok":true,"version":1}\n');
+  assert.equal(calls.length, 2, "machine list plus exec; no agent listing");
+  assert.deepEqual([calls[0]!.command, calls[0]!.args], ["hc-bin", ["machine", "ls", "--json"]]);
+  assert.equal(calls[0]!.timeoutMs, DISCOVERY_TIMEOUT_MS);
+  const exec = calls[1]!;
+  assert.equal(exec.command, "hc-bin");
+  assert.deepEqual(exec.args, [
+    "exec", "--on", "Workstation", "--timeout", "15", "-i", "--json", "--",
+    "C:/Program Files/nodejs/node.exe", "C:/pi tools/cli.mjs", "relay", "--envelope-stdin", "--json",
+  ]);
+  assert.equal(exec.args.some((arg) => arg.includes(hostileText)), false);
+  assert.equal(JSON.parse(exec.stdin!).text, hostileText);
+  assert.equal(JSON.parse(exec.stdin!).target, "reviewer");
+  assert.ok(exec.timeoutMs! >= DELIVERY_TIMEOUT_MS);
+});
+
+test("hc transport sends the same envelope bytes as the herdr transport", async () => {
+  const stdins: Record<string, string | undefined> = {};
+  const herdrRun: CommandRunner = async (command, args, stdin) => {
+    if (command === "ssh") { stdins.herdr = stdin; return { code: 0, stdout: '{"ok":true}', stderr: "" }; }
+    return discoveryResult(command, args) ?? { code: 0, stdout: "{}", stderr: "" };
+  };
+  const hcRun: CommandRunner = async (command, args, stdin) => {
+    if (args[0] === "machine") return { code: 0, stdout: JSON.stringify({ machines: [{ name: "workstation", state: "up" }] }), stderr: "" };
+    stdins.hc = stdin;
+    return { code: 0, stdout: hcReply('{"ok":true}'), stderr: "" };
+  };
+  await sendCrossMachine("reviewer@workstation", "same text", origin, { run: herdrRun, herdrBin: "herdr" });
+  await sendCrossMachine("reviewer@workstation", "same text", origin, { run: hcRun, transport: "hc" });
+  // The herdr discovery resolves the session id; use the same target form so both envelopes name the same target.
+  const herdr = JSON.parse(stdins.herdr!);
+  const hc = JSON.parse(stdins.hc!);
+  assert.equal(herdr.target, "00000000-0000-4000-8000-000000000001");
+  assert.equal(hc.target, "reviewer");
+  herdr.target = hc.target;
+  assert.equal(JSON.stringify(herdr), JSON.stringify(hc));
+  assert.equal(hc.version, 1);
+  assert.equal(hc.trust, "ssh-asserted");
+  assert.equal(hc.origin.machine, "laptop");
+  assert.ok(stdins.hc!.endsWith("\n"));
+
+  const uuidTarget = `${origin.sessionId}@workstation`;
+  await sendCrossMachine(uuidTarget, "same text", origin, { run: herdrRun, herdrBin: "herdr" });
+  await sendCrossMachine(uuidTarget, "same text", origin, { run: hcRun, transport: "hc" });
+  assert.equal(stdins.hc, stdins.herdr, "identical bytes for a session-id target");
+});
+
+test("hc transport matches machine names exactly and refuses unknown or disabled machines", async () => {
+  const run = hcRunner(() => ({ code: 0, stdout: hcReply('{"ok":true}') }));
+  for (const machine of ["workstation", "WORKSTATION", "parked", "missing"]) {
+    await assert.rejects(
+      sendCrossMachine(`reviewer@${machine}`, "hi", origin, { run, transport: "hc" }),
+      new RegExp(`hc machine "${machine}" is unknown or disabled`),
+    );
+  }
+  const twice: CommandRunner = async () => ({ code: 0, stdout: JSON.stringify({ machines: [{ name: "a" }, { name: "a" }] }), stderr: "" });
+  await assert.rejects(sendCrossMachine("x@a", "hi", origin, { run: twice, transport: "hc" }), /hc machine "a" is ambiguous/);
+});
+
+test("hc transport reports timeouts, hc failures and incompatible relays", async () => {
+  const send = (execReply: Parameters<typeof hcRunner>[0]) => sendCrossMachine("reviewer@Workstation", "hi", origin, { run: hcRunner(execReply), transport: "hc" });
+  await assert.rejects(send(() => ({ code: 124, stdout: "", timedOut: true })), /via Workstation failed: timed out/);
+  await assert.rejects(send(() => ({ code: 0, stdout: hcReply("", 0, { timed_out: true }) })), /via Workstation failed: timed out/);
+  await assert.rejects(
+    send(() => ({ code: 1, stdout: "", stderr: JSON.stringify({ error: { hint: "", kind: "unreachable", message: "machine is down" } }) })),
+    /via Workstation failed: hc: machine is down/,
+  );
+  await assert.rejects(send(() => ({ code: 0, stdout: hcReply("unknown command: relay", 1) })), /no compatible relay support and needs upgrading/);
+  await assert.rejects(send(() => ({ code: 0, stdout: hcReply('{"version":2,"ok":true}') })), /no compatible relay support/);
+  await assert.rejects(send(() => ({ code: 0, stdout: "not json" })), /no compatible relay support/);
+  await assert.rejects(
+    send(() => ({ code: 0, stdout: hcReply(JSON.stringify({ ok: false, error: "no such session" }), 1) })),
+    /Remote intercom delivery via Workstation failed: no such session/,
+  );
+});
+
+test("hc transport refuses an invalid remote argv before running anything", async () => {
+  const calls: Call[] = [];
+  const run = hcRunner(() => ({ code: 0, stdout: hcReply('{"ok":true}') }), calls);
+  await assert.rejects(
+    sendCrossMachine("reviewer@Workstation", "hi", origin, { run, transport: "hc", remoteArgv: ["node", "a;b"] }),
+    /Remote argv/,
+  );
+  assert.equal(calls.some((call) => call.args[0] === "exec"), false);
+});
+
+test("hc transport never calls herdr or ssh and ignores the remote command", async () => {
+  const calls: Call[] = [];
+  const run = hcRunner(() => ({ code: 0, stdout: hcReply('{"ok":true,"version":1}\n') }), calls);
+  await sendCrossMachine("reviewer@Workstation", "hi", origin, { run, transport: "hc", remoteCommand: "" });
+  assert.deepEqual(calls.map((call) => call.command), ["hc", "hc"]);
+  // An unknown hc machine is not retried as a plain SSH host.
+  await assert.rejects(sendCrossMachine("reviewer@buildbox", "hi", origin, { run, transport: "hc" }), /hc machine "buildbox" is unknown or disabled/);
+  assert.equal(calls.some((call) => call.command === "ssh" || call.command === "herdr"), false);
+});
+
+test("hc transport surfaces a stdin failure from the runner", async () => {
+  const run: CommandRunner = async (_command, args) => {
+    if (args[0] === "machine") return { code: 0, stdout: hcMachines, stderr: "" };
+    throw new Error("write EPIPE");
+  };
+  await assert.rejects(sendCrossMachine("reviewer@Workstation", "hi", origin, { run, transport: "hc" }), /EPIPE/);
+});
+
+test("hc transport reports a non-zero hc exit with a non-JSON stdout", async () => {
+  const run = hcRunner(() => ({ code: 3, stdout: "", stderr: JSON.stringify({ error: { message: "machine is down" } }) }));
+  await assert.rejects(
+    sendCrossMachine("reviewer@Workstation", "hi", origin, { run, transport: "hc" }),
+    /via Workstation failed: hc: machine is down/,
+  );
+});

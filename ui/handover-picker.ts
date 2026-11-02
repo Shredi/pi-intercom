@@ -30,6 +30,8 @@ export interface HandoverPickerOptions {
   sessions: SessionInfo[];
   lister: RemoteSessionLister;
   preselectSessionId?: string;
+  /** With `hc`, remote machines are listed without sessions and the target is typed (hc knows terminals, not Pi sessions). */
+  transport?: "herdr" | "hc";
 }
 
 type MachineEntry =
@@ -47,7 +49,8 @@ type Item =
   | { kind: "local"; session: SessionInfo }
   | { kind: "project" }
   | { kind: "fetch" }
-  | { kind: "remote"; machine: SavedMachine; agent: RemoteAgent };
+  | { kind: "remote"; machine: SavedMachine; agent: RemoteAgent }
+  | { kind: "machine"; machine: SavedMachine };
 
 /** pi-subagents registers children under a "subagent-<agent>-<run>" session id; their name is the task text. */
 function isSubagentChild(session: SessionInfo): boolean {
@@ -68,8 +71,11 @@ export class HandoverPicker implements Component {
   private remote: RemoteState = { state: "idle" };
   private closed = false;
   private selectedIndex = 0;
-  private focus: "list" | "task" = "list";
+  private focus: "list" | "task" | "target" = "list";
   private readonly taskInput = new Input();
+  private readonly targetInput = new Input();
+  private readonly transport: "herdr" | "hc";
+  private targetMachine: SavedMachine | undefined;
 
   constructor(
     tui: TUI,
@@ -82,6 +88,7 @@ export class HandoverPicker implements Component {
     this.theme = theme;
     this.keybindings = keybindings;
     this.lister = options.lister;
+    this.transport = options.transport ?? "herdr";
     this.done = done;
     this.localSessions = options.sessions
       .filter((session) => session.id !== options.currentSession.id && !isSubagentChild(session))
@@ -99,6 +106,7 @@ export class HandoverPicker implements Component {
     if (this.remote.state === "machines") {
       for (const entry of this.remote.machines) {
         if (entry.state !== "done") continue;
+        if (this.transport === "hc") items.push({ kind: "machine", machine: entry.machine });
         for (const agent of entry.agents) items.push({ kind: "remote", machine: entry.machine, agent });
       }
     }
@@ -113,6 +121,10 @@ export class HandoverPicker implements Component {
   invalidate(): void {}
 
   handleInput(data: string): void {
+    if (this.focus === "target") {
+      this.handleTargetInput(data);
+      return;
+    }
     if (this.keybindings.matches(data, "tui.select.cancel")) {
       this.close(undefined);
       return;
@@ -143,9 +155,33 @@ export class HandoverPicker implements Component {
     this.tui.requestRender();
   }
 
+  private handleTargetInput(data: string): void {
+    if (this.keybindings.matches(data, "tui.select.cancel")) {
+      this.focus = "list";
+      this.targetMachine = undefined;
+    } else if (this.keybindings.matches(data, "tui.select.confirm")) {
+      const name = this.targetInput.getValue().trim();
+      // The target is name@machine, so the name itself cannot hold "@" or whitespace.
+      if (name && this.targetMachine && !/[@\s]/.test(name)) {
+        const goal = this.taskInput.getValue().trim() || undefined;
+        this.close({ target: { kind: "remote", target: `${name}@${this.targetMachine.label}` }, goal });
+        return;
+      }
+    } else {
+      this.targetInput.handleInput(data);
+    }
+    this.tui.requestRender();
+  }
+
   private activate(item: Item): void {
     if (item.kind === "fetch") {
       void this.fetchRemote();
+      return;
+    }
+    if (item.kind === "machine") {
+      this.targetMachine = item.machine;
+      this.focus = "target";
+      this.tui.requestRender();
       return;
     }
     const goal = this.taskInput.getValue().trim() || undefined;
@@ -181,7 +217,7 @@ export class HandoverPicker implements Component {
     await Promise.all(machines.map(async (machine, index) => {
       let entry: MachineEntry;
       try {
-        entry = { machine, state: "done", agents: await this.lister.listAgents(machine) };
+        entry = { machine, state: "done", agents: this.transport === "hc" ? [] : await this.lister.listAgents(machine) };
       } catch (error) {
         entry = { machine, state: "error", error: errorMessage(error) };
       }
@@ -259,16 +295,19 @@ export class HandoverPicker implements Component {
       this.remote.state === "idle" ? "Fetch sessions from other machines" : "Fetch again",
     );
     if (this.remote.state === "listing") {
-      body.push(row(dim("  Listing saved Herdr machines…")));
+      body.push(row(dim(this.transport === "hc" ? "  Listing hc machines…" : "  Listing saved Herdr machines…")));
     } else if (this.remote.state === "error") {
       body.push(...errorRows(this.remote.error));
     } else if (this.remote.state === "machines") {
-      if (this.remote.machines.length === 0) body.push(row(dim("  No enabled saved Herdr machines.")));
+      if (this.remote.machines.length === 0) body.push(row(dim(this.transport === "hc" ? "  No enabled hc machines." : "  No enabled saved Herdr machines.")));
       for (const entry of this.remote.machines) {
         if (entry.state === "fetching") {
           body.push(row(dim(`  ${entry.machine.label}: fetching…`)));
         } else if (entry.state === "error") {
           body.push(...errorRows(entry.error));
+        } else if (this.transport === "hc") {
+          const item = items.find((candidate) => candidate.kind === "machine" && candidate.machine === entry.machine)!;
+          pushItem(item, `${entry.machine.label}: enter a session name or ID…`);
         } else if (entry.agents.length === 0) {
           body.push(row(dim(`  ${entry.machine.label}: no Pi sessions`)));
         } else {
@@ -300,8 +339,15 @@ export class HandoverPicker implements Component {
       ? `${taskLabel}${this.taskInput.render(Math.max(1, contentWidth - visibleWidth(taskLabel)))[0] ?? ""}`
       : dim(`${taskLabel}${this.taskInput.getValue()}`);
 
+    const targetLabel = this.targetMachine ? ` Session on ${this.targetMachine.label} (name or ID): ` : "";
+    const targetLine = this.focus === "target"
+      ? `${targetLabel}${this.targetInput.render(Math.max(1, contentWidth - visibleWidth(targetLabel)))[0] ?? ""}`
+      : undefined;
+
     const keys = (id: string) => this.keybindings.getKeys(id as Parameters<KeybindingsManager["getKeys"]>[0]).join("/");
-    const footer = `${keys("tui.select.confirm")}: Hand over • ${keys("tui.input.tab")}: ${this.focus === "list" ? "Next task" : "List"} • ${keys("tui.select.cancel")}: Close`;
+    const footer = this.focus === "target"
+      ? `${keys("tui.select.confirm")}: Hand over • ${keys("tui.select.cancel")}: Back`
+      : `${keys("tui.select.confirm")}: Hand over • ${keys("tui.input.tab")}: ${this.focus === "list" ? "Next task" : "List"} • ${keys("tui.select.cancel")}: Close`;
 
     return [
       border(`╭${"─".repeat(contentWidth)}╮`),
@@ -309,6 +355,7 @@ export class HandoverPicker implements Component {
       separator,
       ...visible,
       separator,
+      ...(targetLine === undefined ? [] : [row(targetLine)]),
       row(taskLine),
       separator,
       row(dim(` ${footer}`)),

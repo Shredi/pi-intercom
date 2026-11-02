@@ -339,6 +339,9 @@ export async function runMain(argv: readonly string[] = process.argv.slice(2)): 
     machineName: config.crossMachine.machineName,
     crossMachineSend: (target, text, origin) => sendCrossMachine(target, text, origin, {
       remoteCommand: config.crossMachine.remoteCommand,
+      transport: config.crossMachine.transport,
+      hcBin: config.crossMachine.hcBin,
+      remoteArgv: config.crossMachine.remoteArgv,
     }),
   });
 }
