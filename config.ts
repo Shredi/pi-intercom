@@ -3,6 +3,7 @@ import { join } from "path";
 import { hostname } from "os";
 import { getIntercomDirPath } from "./broker/paths.ts";
 import { defaultMachineName } from "./cross-machine-envelope.ts";
+import { validateRemoteArgv } from "./cross-machine-discovery.ts";
 
 const DEFAULT_ASK_TIMEOUT_MS = 10 * 60 * 1000;
 const INTERCOM_SCOPE_ID_ENV = "PI_INTERCOM_SCOPE_ID";
@@ -37,8 +38,14 @@ export type BusyDeliveryPolicy = "steer" | "human-first";
 export interface CrossMachineConfig {
   /** Name peers use for this host in their Herdr saved-machine lists. */
   machineName: string;
-  /** Command invoked through SSH on remote machines. */
+  /** Command invoked through SSH on remote machines (herdr transport only). */
   remoteCommand: string;
+  /** How cross-machine sends reach other machines: Herdr saved machines over SSH, or herdr-core's `hc`. */
+  transport: "herdr" | "hc";
+  /** The `hc` executable (hc transport). The HC_BIN environment variable overrides it. */
+  hcBin: string;
+  /** Program and leading arguments run on the remote machine through `hc exec`, without a shell (hc transport). */
+  remoteArgv: string[];
 }
 
 export interface IntercomConfig {
@@ -88,13 +95,21 @@ const defaults: IntercomConfig = {
   crossMachine: {
     machineName: defaultMachineName(hostname()),
     remoteCommand: "pi-intercom",
+    transport: "herdr",
+    hcBin: "hc",
+    remoteArgv: ["pi-intercom"],
   },
 };
+
+function withEnvHcBin(crossMachine: CrossMachineConfig): CrossMachineConfig {
+  const hcBin = process.env.HC_BIN?.trim();
+  return hcBin ? { ...crossMachine, hcBin } : crossMachine;
+}
 
 export function loadConfig(): IntercomConfig {
   const configPath = getConfigPath();
   if (!existsSync(configPath)) {
-    return { ...defaults, crossMachine: { ...defaults.crossMachine } };
+    return { ...defaults, crossMachine: withEnvHcBin({ ...defaults.crossMachine, remoteArgv: [...defaults.crossMachine.remoteArgv] }) };
   }
   
   try {
@@ -107,7 +122,7 @@ export function loadConfig(): IntercomConfig {
     const parsedConfig = parsed as Record<string, unknown>;
     const config: IntercomConfig = {
       ...defaults,
-      crossMachine: { ...defaults.crossMachine },
+      crossMachine: { ...defaults.crossMachine, remoteArgv: [...defaults.crossMachine.remoteArgv] },
     };
 
     if (Object.hasOwn(parsedConfig, "brokerCommand")) {
@@ -210,8 +225,26 @@ export function loadConfig(): IntercomConfig {
         }
         config.crossMachine.remoteCommand = crossMachine.remoteCommand.trim();
       }
+      if (Object.hasOwn(crossMachine, "transport")) {
+        if (crossMachine.transport !== "herdr" && crossMachine.transport !== "hc") {
+          throw new Error(`"crossMachine.transport" must be "herdr" or "hc"`);
+        }
+        config.crossMachine.transport = crossMachine.transport;
+      }
+      if (Object.hasOwn(crossMachine, "hcBin")) {
+        if (typeof crossMachine.hcBin !== "string" || !crossMachine.hcBin.trim()) {
+          throw new Error(`"crossMachine.hcBin" must be a non-empty string`);
+        }
+        config.crossMachine.hcBin = crossMachine.hcBin.trim();
+      }
+      if (Object.hasOwn(crossMachine, "remoteArgv")) {
+        const problem = validateRemoteArgv(crossMachine.remoteArgv);
+        if (problem) throw new Error(`"crossMachine.remoteArgv" ${problem}`);
+        config.crossMachine.remoteArgv = [...(crossMachine.remoteArgv as string[])];
+      }
     }
 
+    config.crossMachine = withEnvHcBin(config.crossMachine);
     return config;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);

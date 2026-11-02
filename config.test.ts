@@ -73,11 +73,77 @@ test("loadConfig accepts cross-machine overrides", async () => {
       assert.deepEqual(loadConfig().crossMachine, {
         machineName: "laptop",
         remoteCommand: "/opt/tools/pi-intercom",
+        transport: "herdr",
+        hcBin: process.env.HC_BIN?.trim() || "hc",
+        remoteArgv: ["pi-intercom"],
       });
     });
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+async function withCrossMachine<T>(crossMachine: unknown, fn: () => T | Promise<T>): Promise<T> {
+  const root = mkdtempSync(join(tmpdir(), "pi-intercom-config-"));
+  try {
+    mkdirSync(join(root, "intercom"), { recursive: true });
+    writeFileSync(join(root, "intercom", "config.json"), JSON.stringify({ crossMachine }));
+    return await withAgentDir(root, fn);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+test("loadConfig defaults the hc transport keys and accepts overrides", async () => {
+  const previous = process.env.HC_BIN;
+  delete process.env.HC_BIN;
+  try {
+    const root = mkdtempSync(join(tmpdir(), "pi-intercom-config-"));
+    try {
+      await withAgentDir(root, () => {
+        const config = loadConfig().crossMachine;
+        assert.equal(config.transport, "herdr");
+        assert.equal(config.hcBin, "hc");
+        assert.deepEqual(config.remoteArgv, ["pi-intercom"]);
+      });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+    const remoteArgv = ["C:/Program Files/nodejs/node.exe", "C:\\tools\\pi-intercom\\cli.mjs"];
+    await withCrossMachine({ transport: "hc", hcBin: "/opt/bin/hc", remoteArgv }, () => {
+      const config = loadConfig().crossMachine;
+      assert.deepEqual([config.transport, config.hcBin, config.remoteArgv], ["hc", "/opt/bin/hc", remoteArgv]);
+    });
+    process.env.HC_BIN = "/env/hc";
+    await withCrossMachine({ hcBin: "/opt/bin/hc" }, () => assert.equal(loadConfig().crossMachine.hcBin, "/env/hc"));
+  } finally {
+    if (previous === undefined) delete process.env.HC_BIN;
+    else process.env.HC_BIN = previous;
+  }
+});
+
+test("loadConfig rejects invalid hc transport keys by name", async () => {
+  const cases: Array<[unknown, RegExp]> = [
+    [{ transport: "ssh" }, /"crossMachine.transport" must be "herdr" or "hc"/],
+    [{ hcBin: " " }, /"crossMachine.hcBin" must be a non-empty string/],
+    [{ remoteArgv: [] }, /"crossMachine.remoteArgv" must be an array of 1 to 8 words/],
+    [{ remoteArgv: "pi-intercom" }, /"crossMachine.remoteArgv" must be an array/],
+    [{ remoteArgv: Array.from({ length: 9 }, () => "a") }, /"crossMachine.remoteArgv" must be an array of 1 to 8 words/],
+    [{ remoteArgv: ["node", "a;b"] }, /"crossMachine.remoteArgv" words must be strings/],
+    [{ remoteArgv: ["node", 7] }, /"crossMachine.remoteArgv" words must be strings/],
+    [{ remoteArgv: ["-x"] }, /"crossMachine.remoteArgv" first word must not start with -/],
+  ];
+  for (const [crossMachine, pattern] of cases) {
+    await withCrossMachine(crossMachine, () => assert.throws(() => loadConfig(), pattern));
+  }
+  await withCrossMachine({ remoteArgv: Array.from({ length: 8 }, () => "a") }, () => assert.equal(loadConfig().crossMachine.remoteArgv.length, 8));
+});
+
+test("loadConfig refuses a remoteArgv first word starting with - after leading spaces", async () => {
+  await withCrossMachine({ remoteArgv: [" -x"] }, () =>
+    assert.throws(() => loadConfig(), /"crossMachine.remoteArgv" first word must not start with -/));
+  await withCrossMachine({ remoteArgv: ["C:/Program Files/x.exe"] }, () =>
+    assert.deepEqual(loadConfig().crossMachine.remoteArgv, ["C:/Program Files/x.exe"]));
 });
 
 test("loadConfig accepts inboundTrigger replies policy", async () => {

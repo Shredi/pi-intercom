@@ -132,3 +132,59 @@ test("handover picker renders lines at the declared overlay width", () => {
     press("tui.input.tab", "a long next task that does not fit in a narrow overlay");
   }
 });
+
+test("handover picker with the hc transport lists machines and takes a typed target", async () => {
+  const results: Array<HandoverPickerResult | undefined> = [];
+  const lister: RemoteSessionLister = {
+    listMachines: async () => [
+      { label: "Workstation", target: "Workstation", enabled: true },
+      { label: "parked", target: "parked", enabled: false },
+    ],
+    listAgents: async () => assert.fail("hc has no agent listing"),
+  };
+  const picker = new HandoverPicker(
+    { requestRender() {} } as any,
+    theme as any,
+    keybindings as any,
+    { currentSession: self, sessions: roster, lister, transport: "hc" },
+    (result) => results.push(result),
+  );
+  const press = (...keys: string[]) => keys.forEach((key) => picker.handleInput(KEYS[key] ?? key));
+  press("tui.select.down", "tui.select.down", "tui.select.down", "tui.select.confirm");
+  await new Promise((resolve) => setImmediate(resolve));
+  const text = () => picker.render(88).join("\n");
+  assert.match(text(), /Workstation: enter a session name or ID/);
+  assert.doesNotMatch(text(), /parked/);
+
+  press("tui.select.down", "tui.select.confirm");
+  assert.match(text(), /Session on Workstation \(name or ID\):/);
+  press("tui.select.confirm");
+  assert.deepEqual(results, [], "an empty target does not close the picker");
+  press("reviewer", "tui.select.confirm");
+  assert.deepEqual(results, [{ target: { kind: "remote", target: "reviewer@Workstation" }, goal: undefined }]);
+});
+
+test("handover picker hc footer follows focus", async () => {
+  const lister: RemoteSessionLister = {
+    listMachines: async () => [{ label: "Workstation", target: "Workstation", enabled: true }],
+    listAgents: async () => assert.fail("hc has no agent listing"),
+  };
+  const picker = new HandoverPicker(
+    { requestRender() {} } as any,
+    theme as any,
+    keybindings as any,
+    { currentSession: self, sessions: roster, lister, transport: "hc" },
+    () => {},
+  );
+  const press = (...keys: string[]) => keys.forEach((key) => picker.handleInput(KEYS[key] ?? key));
+  const text = () => picker.render(88).join("\n");
+  press("tui.select.down", "tui.select.down", "tui.select.down", "tui.select.confirm");
+  await new Promise((resolve) => setImmediate(resolve));
+  press("tui.select.down", "tui.select.confirm");
+  assert.match(text(), /Session on Workstation/);
+  assert.match(text(), /confirm: Hand over • cancel: Back/);
+  assert.doesNotMatch(text(), /Close/);
+  press("tui.select.cancel");
+  assert.doesNotMatch(text(), /Session on Workstation/);
+  assert.match(text(), /cancel: Close/);
+});
