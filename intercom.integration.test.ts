@@ -6009,3 +6009,76 @@ test("registered inline renderer follows real CustomMessageComponent rebuild and
     });
   }
 });
+
+for (const scenario of [
+  { name: "noWake true", noWake: true as unknown, expectNoWake: true },
+  { name: "no noWake", noWake: undefined as unknown, expectNoWake: false },
+]) {
+  test(`extension outbox request with ${scenario.name} sends accordingly`, { concurrency: false }, async () => {
+    const { planner, cleanup } = await setupClients();
+    const { default: piIntercomExtension } = await import("./index.ts");
+    const harness = createExtensionHarness("outbox-nowake-worker");
+    const results: IntercomOutboxResultV1[] = [];
+    try {
+      harness.pi.events.on(INTERCOM_OUTBOX_RESULT_EVENT, (payload) => results.push(payload as IntercomOutboxResultV1));
+      piIntercomExtension(harness.pi as never);
+      await harness.emitLifecycle("session_start");
+      const delivered = once(planner, "message") as Promise<[SessionInfo, Message]>;
+      harness.pi.events.emit(INTERCOM_OUTBOX_REQUEST_EVENT, {
+        version: 1,
+        requestId: "outbox-nowake-1",
+        extensionId: "example-extension",
+        extensionName: "Example Extension",
+        to: "planner",
+        message: "Quiet hello.",
+        ...(scenario.noWake !== undefined ? { noWake: scenario.noWake } : {}),
+      });
+      const [result] = await waitForOutboxResults(results, 1);
+      assert.equal(result?.status, "sent");
+      const [, message] = await Promise.race([
+        delivered,
+        new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error("Timed out waiting for outbox delivery")), 3000)),
+      ]);
+      if (scenario.expectNoWake) {
+        assert.equal(message.noWake, true);
+      } else {
+        assert.equal("noWake" in message && message.noWake !== undefined, false);
+      }
+    } finally {
+      await harness.emitLifecycle("session_shutdown");
+      await cleanup();
+    }
+  });
+}
+
+test("extension outbox request with non-boolean noWake is rejected and nothing is sent", { concurrency: false }, async () => {
+  const { planner, cleanup } = await setupClients();
+  const { default: piIntercomExtension } = await import("./index.ts");
+  const harness = createExtensionHarness("outbox-nowake-bad-worker");
+  const results: IntercomOutboxResultV1[] = [];
+  const received: Message[] = [];
+  try {
+    planner.on("message", (_from: SessionInfo, message: Message) => received.push(message));
+    harness.pi.events.on(INTERCOM_OUTBOX_RESULT_EVENT, (payload) => results.push(payload as IntercomOutboxResultV1));
+    piIntercomExtension(harness.pi as never);
+    await harness.emitLifecycle("session_start");
+    harness.pi.events.emit(INTERCOM_OUTBOX_REQUEST_EVENT, {
+      version: 1,
+      requestId: "outbox-nowake-bad-1",
+      extensionId: "example-extension",
+      extensionName: "Example Extension",
+      to: "planner",
+      message: "Should not arrive.",
+      noWake: "yes",
+    });
+    const [result] = await waitForOutboxResults(results, 1);
+    assert.equal(result?.status, "rejected");
+    assert.equal(result?.code, "invalid_request");
+    assert.equal(result?.detail, "noWake must be a boolean");
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    assert.equal(received.length, 0);
+  } finally {
+    await harness.emitLifecycle("session_shutdown");
+    await cleanup();
+  }
+});

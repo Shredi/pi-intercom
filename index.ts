@@ -576,6 +576,9 @@ function parseOutboxRequestPayload(payload: unknown): { ok: true; request: Inter
   if (typeof record.message !== "string" || !record.message.trim()) {
     return { ok: false, requestId, extensionId, extensionName, detail: "message is required" };
   }
+  if (record.noWake !== undefined && typeof record.noWake !== "boolean") {
+    return { ok: false, requestId, extensionId, extensionName, detail: "noWake must be a boolean" };
+  }
   return {
     ok: true,
     request: {
@@ -585,6 +588,7 @@ function parseOutboxRequestPayload(payload: unknown): { ok: true; request: Inter
       extensionName,
       to: record.to.trim(),
       message: record.message,
+      ...(record.noWake !== undefined ? { noWake: record.noWake } : {}),
     },
   };
 }
@@ -1301,6 +1305,7 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
         const result = await activeClient.send(target.id, {
           messageId: request.requestId,
           text: request.message,
+          ...(request.noWake ? { noWake: true } : {}),
           provenance: {
             type: "extension_outbox",
             extensionId: request.extensionId,

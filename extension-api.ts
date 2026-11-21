@@ -40,6 +40,8 @@ export interface IntercomOutboxRequestV1 {
   extensionName: string;
   to: string;
   message: string;
+  /** Deliver without waking an idle receiver. */
+  noWake?: boolean;
 }
 
 export type IntercomOutboxRequest = IntercomOutboxRequestV1;

@@ -592,7 +592,7 @@ pi.events.emit(INTERCOM_OUTBOX_REQUEST_EVENT, {
 });
 ```
 
-`confirmSend` applies to outbox requests. If confirmation is required and no UI is available, the request fails closed with `confirmation_unavailable`. The outbox resolves the target through the current session's scoped intercom client, so extensions cannot choose the sender, scope, or resolved target ID. Duplicate `requestId` values are rejected and do not deliver again. Receiver messages include structured `extension_outbox` provenance in message details; provenance is not prepended to the message body.
+`confirmSend` applies to outbox requests. If confirmation is required and no UI is available, the request fails closed with `confirmation_unavailable`. The outbox resolves the target through the current session's scoped intercom client, so extensions cannot choose the sender, scope, or resolved target ID. Duplicate `requestId` values are rejected and do not deliver again. Receiver messages include structured `extension_outbox` provenance in message details; provenance is not prepended to the message body. Set optional `noWake: true` on the request (must be a boolean, otherwise it is rejected with `invalid_request`) to deliver without waking an idle receiver; without it the message wakes the receiver as before.
 
 ### Session identity claim
 
